@@ -1,39 +1,75 @@
+from __future__ import annotations
 from abc import ABC, abstractmethod
+from enum import Enum
+from dataclasses import dataclass, field
+import asyncio
 import time
+import traceback
+from typing import Any, Optional
+
+class TaskStatus(str, Enum):
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    SKIPPED = "SKIPPED"
+
+
+@dataclass
+class TaskResult:
+    ok: bool
+    output: Any = None
+    error: Optional[str] = None
+    started_at: float = field(default_factory=time.time)
+    finished_at: Optional[float] = None
+    retries: int = 0
+
 
 class Task(ABC):
-    def __init__(self, name: str, max_replies: int = 3):
+    def __init__(self, name: str, max_replies: int = 3, retry_backoff_seconds: float = 1.0):
         self.name = name
-        self.status = "PENDING"
+        self.status: TaskStatus = TaskStatus.PENDING
         self.max_replies = max_replies
+        self.retry_backoff_seconds = retry_backoff_seconds
     
     @abstractmethod
-    def run(self, **kwargs):
+    async def run(self, **kwargs):
         pass
 
-    def execute(self, **kwargs):
-        self.status = "RUNNING"
+    async def execute(self, **kwargs):
         attempt = 0
-        while attempt <= self.max_replies:
+        result = TaskResult(ok=False)
+        self.status = TaskStatus.RUNNING
+
+        while True:
             try:
+                output = await self._ensure_awaitable(self.run)(**kwargs)
+                self.status = TaskStatus.SUCCEEDED
+                result.ok = True
+                result.output = output
+                result.finished_at = time.time()
+                return result
+            except Exception:
                 attempt += 1
-                start = time.time()
-                result = self.run(**kwargs)
-                end = time.time()
-                self.status = "COMPLETED"
-                return {
-                    "ok" : True,
-                    "result": result,
-                    "time_taken": end - start,
-                    "tries": attempt,
-                    "error": None
-                }
-            except Exception as e:
-                print(f"Attempt {attempt} Failed: {e}")
-                if attempt > self.max_replies:
-                    self.status = "FAILED"
-                    raise
-                time.sleep(1)
+                result.retries = attempt
+                tb = traceback.format_exc()
+
+                if attempt >= self.max_replies:
+                    self.status = TaskStatus.FAILED
+                    result.error = tb
+                    result.finished_at = time.time()
+                    return result
+                
+                await asyncio.sleep(self.retry_backoff_seconds * attempt)
+    
+    @staticmethod
+    def _ensure_awaitable(func):
+        if asyncio.iscoroutinefunction(func):
+            return func
+        else:
+            async def wrapper(*args, **kwargs):
+                return func(*args, **kwargs)
+            return wrapper
 
 
 class PrintTask(Task):
